@@ -1,0 +1,1 @@
+-- TODO: create tables for authorities, policies, provisioners, certificates, users, roles, audit_logs
