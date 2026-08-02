@@ -1,3 +1,4 @@
+-- Register of Certificate Authorities
 CREATE TABLE authorities (
     id              CHAR(36)        NOT NULL PRIMARY KEY,
     name            VARCHAR(128)    NOT NULL,
@@ -20,6 +21,7 @@ CREATE TABLE authorities (
     CONSTRAINT uq_authorities_name UNIQUE (name),
     CONSTRAINT uq_authorities_fingerprint UNIQUE (fingerprint)
 );
+-- Register of Registering Authority Policies
 CREATE TABLE policies (
     id                      CHAR(36)        NOT NULL PRIMARY KEY,
     authority_id            CHAR(36)        NOT NULL,
@@ -42,6 +44,7 @@ CREATE TABLE policies (
         FOREIGN KEY (authority_id) REFERENCES authorities(id)
         ON DELETE CASCADE
 );
+-- Register of Certificate Provisioners
 CREATE TABLE provisioners (
     id              CHAR(36)        NOT NULL PRIMARY KEY,
     authority_id    CHAR(36)        NOT NULL,
@@ -57,6 +60,7 @@ CREATE TABLE provisioners (
 
     CONSTRAINT uq_provisioners_name UNIQUE (authority_id, name)
 );
+-- Register of Issued Certificates for all Provisioned Authorities
 CREATE TABLE certificates (
     id                  CHAR(36)        NOT NULL PRIMARY KEY,
     authority_id        CHAR(36)        NOT NULL,
@@ -91,6 +95,7 @@ CREATE TABLE certificates (
 
     CONSTRAINT uq_cert_serial UNIQUE (serial_number)
 );
+-- Register of Step-CA GUI Users
 CREATE TABLE users (
     id              CHAR(36)        NOT NULL PRIMARY KEY,
     username        VARCHAR(64)     NOT NULL UNIQUE,
@@ -102,6 +107,7 @@ CREATE TABLE users (
     created_at      DATETIME        NOT NULL,
     updated_at      DATETIME        NOT NULL
 );
+-- Definitions of User Roles
 CREATE TABLE roles (
     id              CHAR(36)        NOT NULL PRIMARY KEY,
     name            VARCHAR(64)     NOT NULL UNIQUE,
@@ -110,6 +116,7 @@ CREATE TABLE roles (
     created_at      DATETIME        NOT NULL,
     updated_at      DATETIME        NOT NULL
 );
+-- Register of Roles granted to Users
 CREATE TABLE user_roles (
     user_id         CHAR(36)        NOT NULL,
     role_id         CHAR(36)        NOT NULL,
@@ -129,6 +136,7 @@ CREATE TABLE user_roles (
         FOREIGN KEY (authority_id) REFERENCES authorities(id)
         ON DELETE CASCADE
 );
+-- Book of audit logs for all monitored actions
 CREATE TABLE audit_logs (
     id                  CHAR(36)        NOT NULL PRIMARY KEY,
     timestamp           DATETIME        NOT NULL,
