@@ -1,5 +1,3 @@
-<script>
-    // TODO: dashboard
-</script>
+<h1>step-gui Dashboard</h1>
 
-<h1>step-gui</h1>
+<p>Welcome to the PKI administration console.</p>
