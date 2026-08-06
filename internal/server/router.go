@@ -58,4 +58,11 @@ func RegisterRoutes(e *echo.Echo, cfg *config.Config) {
     api.RegisterCertificateHandlers(apiGroup)
     api.RegisterUserHandlers(apiGroup)
     api.RegisterAuditHandlers(apiGroup)
+
+    stepcaClient = stepca.New(
+        cfg.StepCA.URL,
+        cfg.StepCA.Provisioner,
+        loadKey(cfg.StepCA.KeyFile),
+    )
+
 }
