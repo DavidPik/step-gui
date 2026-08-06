@@ -14,6 +14,12 @@ func InitRepositories(ar repository.AuthorityRepository) {
     authorityRepo = ar
 }
 
+var stepcaClient *stepca.Client
+
+func InitStepCA(c *stepca.Client) {
+    stepcaClient = c
+}
+
 // TODO: nahradit skutečným generátorem UUID
 func generateUUID() string {
     return "TODO-UUID"
