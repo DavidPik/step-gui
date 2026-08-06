@@ -64,5 +64,5 @@ func RegisterRoutes(e *echo.Echo, cfg *config.Config) {
         cfg.StepCA.Provisioner,
         loadKey(cfg.StepCA.KeyFile),
     )
-
+    api.InitStepCA(stepcaClient)
 }
