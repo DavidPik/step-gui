@@ -19,6 +19,10 @@ func generateUUID() string {
     return "TODO-UUID"
 }
 
+func generateSerial() string {
+    return fmt.Sprintf("SN-%d", time.Now().UnixNano())
+}
+
 func nowRFC() string {
     return time.Now().Format(time.RFC3339)
 }
@@ -346,28 +350,54 @@ func issueCertificate(c echo.Context) error {
         return c.JSON(400, map[string]string{"error": "invalid JSON"})
     }
 
-    // TODO: call step-ca client in FÁZE 4
-    // zatím jen uložíme placeholder
+    // Validace vstupu
+    if req.AuthorityID == "" || req.PolicyID == "" || req.CSR == "" {
+        return c.JSON(400, map[string]string{"error": "authority_id, policy_id and csr_pem are required"})
+    }
+
+    // Volání step-ca
+    signResp, err := stepcaClient.SignCSR(req.CSR)
+    if err != nil {
+        return c.JSON(400, map[string]string{"error": fmt.Sprintf("step-ca: %v", err)})
+    }
+
+    // Serial number — zatím placeholder, později doplníme skutečný serial z certifikátu
+    serial := generateSerial()
+
+    now := nowRFC()
 
     cert := &repository.Certificate{
-        ID:           generateUUID(),
-        AuthorityID:  req.AuthorityID,
-        PolicyID:     req.PolicyID,
-        SerialNumber: "TODO-SERIAL",
-        CertPEM:      "TODO-CERT",
-        Status:       "valid",
-        IssuedAt:     nowRFC(),
-        ExpiresAt:    nowRFC(),
-        IssueMethod:  req.IssueMethod,
-        CreatedAt:    nowRFC(),
-        UpdatedAt:    nowRFC(),
+        ID:             generateUUID(),
+        AuthorityID:    req.AuthorityID,
+        PolicyID:       req.PolicyID,
+        ProvisionerID:  nil, // doplníme později
+        SerialNumber:   serial,
+        SubjectCN:      nil, // doplníme později z certifikátu
+        SubjectO:       nil,
+        SAN:            "[]", // doplníme později
+        CertPEM:        signResp.CertPEM,
+        IssuedAt:       now,
+        ExpiresAt:      now, // doplníme později z certifikátu
+        Status:         "valid",
+        RevocationReason: nil,
+        RevocationTime:   nil,
+        IssueMethod:    req.IssueMethod,
+        Metadata:       nil,
+        CreatedAt:      now,
+        UpdatedAt:      now,
     }
 
     if err := certificateRepo.Create(c.Request().Context(), cert); err != nil {
         return c.JSON(400, map[string]string{"error": err.Error()})
     }
 
-    return c.JSON(201, cert)
+    return c.JSON(201, map[string]any{
+        "id":            cert.ID,
+        "serial_number": cert.SerialNumber,
+        "cert_pem":      cert.CertPEM,
+        "chain":         signResp.Chain,
+        "status":        cert.Status,
+    })
 }
 
 func updateCertificate(c echo.Context) error {
