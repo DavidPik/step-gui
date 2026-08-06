@@ -1,18 +1,32 @@
 package server
 
 import (
+    "github.com/jmoiron/sqlx"
     "github.com/labstack/echo/v4"
+    "step-gui/internal/api"
     "step-gui/internal/config"
+    "step-gui/internal/db/repository"
 )
 
+var dbInstance *sqlx.DB // inicializace bude později
+
 func RegisterRoutes(e *echo.Echo, cfg *config.Config) {
-    api := e.Group("/api")
+    apiGroup := e.Group("/api")
 
-    // Health
-    api.GET("/health", handlers.Health)
+    // init repositories
+    authorityRepo := repository.NewAuthorityRepository(dbInstance)
+    api.InitRepositories(authorityRepo)
 
-    // Authorities
-    handlers.RegisterAuthorityHandlers(api)
+    // health
+    apiGroup.GET("/health", func(c echo.Context) error {
+        return c.JSON(200, map[string]string{"status": "ok"})
+    })
+
+    // authorities
+    api.RegisterAuthorityHandlers(apiGroup)
+
+    // TODO: policies, provisioners, certificates, users, audit
+}
 
     // Policies
     handlers.RegisterPolicyHandlers(api)
