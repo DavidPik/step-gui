@@ -3,61 +3,50 @@ package repository
 import (
     "context"
     "database/sql"
+    "encoding/json"
     "fmt"
-    "strings"
     "time"
 
     "github.com/jmoiron/sqlx"
 )
 
-// Certificate represents a certificate record stored in MariaDB.
+// Certificate represents an issued certificate record stored in MariaDB.
 type Certificate struct {
-    ID               string  `db:"id"`
-    AuthorityID      string  `db:"authority_id"`
-    PolicyID         string  `db:"policy_id"`
-    ProvisionerID    *string `db:"provisioner_id"`
-    SerialNumber     string  `db:"serial_number"`
-    SubjectCN        *string `db:"subject_cn"`
-    SubjectO         *string `db:"subject_o"`
-    SAN              string  `db:"san"`
-    CertPEM          string  `db:"cert_pem"`
-    IssuedAt         string  `db:"issued_at"`
-    ExpiresAt        string  `db:"expires_at"`
-    Status           string  `db:"status"`
-    RevocationReason *int    `db:"revocation_reason"`
-    RevocationTime   *string `db:"revocation_time"`
-    IssueMethod      string  `db:"issue_method"`
-    Metadata         *string `db:"metadata"`
-    ApprovalID       *string `db:"approval_id"`
-    OwnerUserID      *string `db:"owner_user_id"`
-    OwnerDeviceID    *string `db:"owner_device_id"`
-    CreatedAt        string  `db:"created_at"`
-    UpdatedAt        string  `db:"updated_at"`
+    ID               string   `db:"id"`
+    AuthorityID      string   `db:"authority_id"`
+    SerialNumber     string   `db:"serial_number"`
+    Subject          string   `db:"subject"`
+    SANs             []string `db:"sans"` // stored as JSON array
+    OwnerUserID      *string  `db:"owner_user_id"`
+    OwnerDeviceID    *string  `db:"owner_device_id"`
+    ProvisionerID    *string  `db:"provisioner_id"`
+    PolicyID         *string  `db:"policy_id"`
+    IssuedAt         string   `db:"issued_at"`
+    NotBefore        *string  `db:"not_before"`
+    NotAfter         *string  `db:"not_after"`
+    Revoked          bool     `db:"revoked"`
+    RevokedAt        *string  `db:"revoked_at"`
+    RevocationReason *string  `db:"revocation_reason"`
+    PEM              *string  `db:"pem"`
+    CreatedAt        string   `db:"created_at"`
+    UpdatedAt        string   `db:"updated_at"`
 }
 
-// CertificateRepository defines persistence operations used by the API and workers.
-//
-// Additional helper methods are included to support Viewer scoping and Approver group scoping:
-// - ListForUser(ctx, userID) returns certificates visible to a specific viewer (their own and those referenced by their requests).
-// - IsVisibleToUser(ctx, authorityID, userID) checks whether an authority is visible to a user.
-// - ListByOwner(ctx, ownerUserID) returns certificates owned by a user.
-// - ListByGroups(ctx, groupIDs) returns certificates that belong to devices/users in the provided groups.
-// - IsOwnedBy(ctx, certID, userID) checks ownership.
-// - IsInGroups(ctx, certID, groupIDs) checks whether a certificate belongs to any of the groups.
+// CertificateRepository defines persistence operations for certificates and helpers used by API and workers.
 type CertificateRepository interface {
     Create(ctx context.Context, c *Certificate) error
     GetByID(ctx context.Context, id string) (*Certificate, error)
+    GetBySerial(ctx context.Context, authorityID string, serial string) (*Certificate, error)
+    ListByOwner(ctx context.Context, ownerUserID string) ([]Certificate, error)
+    ListByDevice(ctx context.Context, deviceID string) ([]Certificate, error)
     ListByAuthority(ctx context.Context, authorityID string) ([]Certificate, error)
+    Revoke(ctx context.Context, id string, reason string) error
     Update(ctx context.Context, c *Certificate) error
     Delete(ctx context.Context, id string) error
 
-    // Viewer / scoping helpers
+    // Visibility helpers
     ListForUser(ctx context.Context, userID string) ([]Certificate, error)
-    IsVisibleToUser(ctx context.Context, authorityID string, userID string) (bool, error)
-    ListByOwner(ctx context.Context, ownerUserID string) ([]Certificate, error)
-    ListByGroups(ctx context.Context, groupIDs []string) ([]Certificate, error)
-    IsOwnedBy(ctx context.Context, certID string, userID string) (bool, error)
-    IsInGroups(ctx context.Context, certID string, groupIDs []string) (bool, error)
+    IsVisibleToUser(ctx context.Context, certID string, userID string) (bool, error)
 }
 
 type certificateRepository struct {
@@ -69,273 +58,658 @@ func NewCertificateRepository(db *sqlx.DB) CertificateRepository {
     return &certificateRepository{db: db}
 }
 
-// Create inserts a new certificate record.
+// Create inserts a new certificate record. SANs will be marshaled to JSON.
 func (r *certificateRepository) Create(ctx context.Context, c *Certificate) error {
     now := time.Now().UTC().Format(time.RFC3339)
     if c.CreatedAt == "" {
         c.CreatedAt = now
     }
     c.UpdatedAt = now
+    if c.IssuedAt == "" {
+        c.IssuedAt = now
+    }
+
+    sansJSON := "[]"
+    if c.SANs != nil {
+        b, err := json.Marshal(c.SANs)
+        if err != nil {
+            return fmt.Errorf("marshal sans: %w", err)
+        }
+        sansJSON = string(b)
+    }
 
     query := `
 INSERT INTO certificates
-(id, subject, cert_type, authority_id, policy_id, provisioner_id, serial, thumbprint,
- subject_cn, subject_o, san, cert_pem, issued_at, expires_at, status, revocation_reason,
- revocation_time, issue_method, stepca_metadata, approval_id, owner_user_id, owner_device_id,
- created_at, updated_at)
+(id, authority_id, serial_number, subject, sans, owner_user_id, owner_device_id, provisioner_id, policy_id,
+ issued_at, not_before, not_after, revoked, revoked_at, revocation_reason, pem, created_at, updated_at)
 VALUES
-(:id, :subject, :cert_type, :authority_id, :policy_id, :provisioner_id, :serial, :thumbprint,
- :subject_cn, :subject_o, :san, :cert_pem, :issued_at, :expires_at, :status, :revocation_reason,
- :revocation_time, :issue_method, :stepca_metadata, :approval_id, :owner_user_id, :owner_device_id,
- :created_at, :updated_at)
+(:id, :authority_id, :serial_number, :subject, :sans, :owner_user_id, :owner_device_id, :provisioner_id, :policy_id,
+ :issued_at, :not_before, :not_after, :revoked, :revoked_at, :revocation_reason, :pem, :created_at, :updated_at)
 `
-    // Map fields expected by DB. Some struct fields have different names in DB schema used earlier;
-    // ensure DB schema matches these column names or adapt accordingly.
     params := map[string]interface{}{
-        "id":               c.ID,
-        "subject":          c.SubjectCN, // subject stored as CN in earlier schema; keep compatibility
-        "cert_type":        c.IssueMethod,
-        "authority_id":     c.AuthorityID,
-        "policy_id":        c.PolicyID,
-        "provisioner_id":   c.ProvisionerID,
-        "serial":           c.SerialNumber,
-        "thumbprint":       nil, // optional: thumbprint can be stored in Metadata or stepca_metadata
-        "subject_cn":       c.SubjectCN,
-        "subject_o":        c.SubjectO,
-        "san":              c.SAN,
-        "cert_pem":         c.CertPEM,
-        "issued_at":        c.IssuedAt,
-        "expires_at":       c.ExpiresAt,
-        "status":           c.Status,
-        "revocation_reason": c.RevocationReason,
-        "revocation_time":   c.RevocationTime,
-        "issue_method":      c.IssueMethod,
-        "stepca_metadata":   c.Metadata,
-        "approval_id":       c.ApprovalID,
+        "id":                c.ID,
+        "authority_id":      c.AuthorityID,
+        "serial_number":     c.SerialNumber,
+        "subject":           c.Subject,
+        "sans":              sansJSON,
         "owner_user_id":     c.OwnerUserID,
         "owner_device_id":   c.OwnerDeviceID,
+        "provisioner_id":    c.ProvisionerID,
+        "policy_id":         c.PolicyID,
+        "issued_at":         c.IssuedAt,
+        "not_before":        c.NotBefore,
+        "not_after":         c.NotAfter,
+        "revoked":           c.Revoked,
+        "revoked_at":        c.RevokedAt,
+        "revocation_reason": c.RevocationReason,
+        "pem":               c.PEM,
         "created_at":        c.CreatedAt,
         "updated_at":        c.UpdatedAt,
     }
-
     _, err := r.db.NamedExecContext(ctx, query, params)
     return err
 }
 
-// GetByID returns a certificate by its ID.
+// GetByID returns a certificate by id.
 func (r *certificateRepository) GetByID(ctx context.Context, id string) (*Certificate, error) {
-    var c Certificate
-    query := `SELECT id, authority_id, policy_id, provisioner_id, serial AS serial_number,
-                 subject_cn, subject_o, san, cert_pem, issued_at, expires_at, status,
-                 revocation_reason, revocation_time, issue_method, stepca_metadata AS metadata,
-                 approval_id, owner_user_id, owner_device_id, created_at, updated_at
-              FROM certificates WHERE id = ? LIMIT 1`
-    if err := r.db.GetContext(ctx, &c, query, id); err != nil {
+    var row struct {
+        ID               string         `db:"id"`
+        AuthorityID      string         `db:"authority_id"`
+        SerialNumber     string         `db:"serial_number"`
+        Subject          string         `db:"subject"`
+        SANs             sql.NullString `db:"sans"`
+        OwnerUserID      sql.NullString `db:"owner_user_id"`
+        OwnerDeviceID    sql.NullString `db:"owner_device_id"`
+        ProvisionerID    sql.NullString `db:"provisioner_id"`
+        PolicyID         sql.NullString `db:"policy_id"`
+        IssuedAt         string         `db:"issued_at"`
+        NotBefore        sql.NullString `db:"not_before"`
+        NotAfter         sql.NullString `db:"not_after"`
+        Revoked          int            `db:"revoked"`
+        RevokedAt        sql.NullString `db:"revoked_at"`
+        RevocationReason sql.NullString `db:"revocation_reason"`
+        PEM              sql.NullString `db:"pem"`
+        CreatedAt        string         `db:"created_at"`
+        UpdatedAt        string         `db:"updated_at"`
+    }
+    query := `
+SELECT id, authority_id, serial_number, subject, sans, owner_user_id, owner_device_id, provisioner_id, policy_id,
+       issued_at, not_before, not_after, revoked, revoked_at, revocation_reason, pem, created_at, updated_at
+FROM certificates
+WHERE id = ? LIMIT 1
+`
+    if err := r.db.GetContext(ctx, &row, query, id); err != nil {
         if err == sql.ErrNoRows {
             return nil, fmt.Errorf("certificate not found")
         }
         return nil, err
     }
-    return &c, nil
+
+    c := &Certificate{
+        ID:          row.ID,
+        AuthorityID: row.AuthorityID,
+        SerialNumber: row.SerialNumber,
+        Subject:     row.Subject,
+        IssuedAt:    row.IssuedAt,
+        CreatedAt:   row.CreatedAt,
+        UpdatedAt:   row.UpdatedAt,
+        SANs:        []string{},
+        Revoked:     row.Revoked != 0,
+    }
+    if row.SANs.Valid && row.SANs.String != "" {
+        _ = json.Unmarshal([]byte(row.SANs.String), &c.SANs)
+    }
+    if row.OwnerUserID.Valid {
+        v := row.OwnerUserID.String
+        c.OwnerUserID = &v
+    }
+    if row.OwnerDeviceID.Valid {
+        v := row.OwnerDeviceID.String
+        c.OwnerDeviceID = &v
+    }
+    if row.ProvisionerID.Valid {
+        v := row.ProvisionerID.String
+        c.ProvisionerID = &v
+    }
+    if row.PolicyID.Valid {
+        v := row.PolicyID.String
+        c.PolicyID = &v
+    }
+    if row.NotBefore.Valid {
+        v := row.NotBefore.String
+        c.NotBefore = &v
+    }
+    if row.NotAfter.Valid {
+        v := row.NotAfter.String
+        c.NotAfter = &v
+    }
+    if row.RevokedAt.Valid {
+        v := row.RevokedAt.String
+        c.RevokedAt = &v
+    }
+    if row.RevocationReason.Valid {
+        v := row.RevocationReason.String
+        c.RevocationReason = &v
+    }
+    if row.PEM.Valid {
+        v := row.PEM.String
+        c.PEM = &v
+    }
+    return c, nil
 }
 
-// ListByAuthority lists certificates filtered by authority_id (empty returns all).
-func (r *certificateRepository) ListByAuthority(ctx context.Context, authorityID string) ([]Certificate, error) {
-    var certs []Certificate
-    var err error
-    if authorityID == "" {
-        query := `SELECT id, authority_id, policy_id, provisioner_id, serial AS serial_number,
-                         subject_cn, subject_o, san, cert_pem, issued_at, expires_at, status,
-                         revocation_reason, revocation_time, issue_method, stepca_metadata AS metadata,
-                         approval_id, owner_user_id, owner_device_id, created_at, updated_at
-                  FROM certificates ORDER BY created_at DESC LIMIT 1000`
-        err = r.db.SelectContext(ctx, &certs, query)
-    } else {
-        query := `SELECT id, authority_id, policy_id, provisioner_id, serial AS serial_number,
-                         subject_cn, subject_o, san, cert_pem, issued_at, expires_at, status,
-                         revocation_reason, revocation_time, issue_method, stepca_metadata AS metadata,
-                         approval_id, owner_user_id, owner_device_id, created_at, updated_at
-                  FROM certificates WHERE authority_id = ? ORDER BY created_at DESC`
-        err = r.db.SelectContext(ctx, &certs, query, authorityID)
-    }
-    if err != nil {
+// GetBySerial returns a certificate by authority and serial number.
+func (r *certificateRepository) GetBySerial(ctx context.Context, authorityID string, serial string) (*Certificate, error) {
+    var id string
+    query := `SELECT id FROM certificates WHERE authority_id = ? AND serial_number = ? LIMIT 1`
+    if err := r.db.GetContext(ctx, &id, query, authorityID, serial); err != nil {
+        if err == sql.ErrNoRows {
+            return nil, fmt.Errorf("certificate not found")
+        }
         return nil, err
     }
-    return certs, nil
+    return r.GetByID(ctx, id)
 }
 
-// Update updates mutable fields of a certificate (metadata, status, revocation fields, updated_at).
-func (r *certificateRepository) Update(ctx context.Context, c *Certificate) error {
-    c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+// ListByOwner returns certificates owned by a user.
+func (r *certificateRepository) ListByOwner(ctx context.Context, ownerUserID string) ([]Certificate, error) {
+    var rows []struct {
+        ID               string         `db:"id"`
+        AuthorityID      string         `db:"authority_id"`
+        SerialNumber     string         `db:"serial_number"`
+        Subject          string         `db:"subject"`
+        SANs             sql.NullString `db:"sans"`
+        OwnerUserID      sql.NullString `db:"owner_user_id"`
+        OwnerDeviceID    sql.NullString `db:"owner_device_id"`
+        ProvisionerID    sql.NullString `db:"provisioner_id"`
+        PolicyID         sql.NullString `db:"policy_id"`
+        IssuedAt         string         `db:"issued_at"`
+        NotBefore        sql.NullString `db:"not_before"`
+        NotAfter         sql.NullString `db:"not_after"`
+        Revoked          int            `db:"revoked"`
+        RevokedAt        sql.NullString `db:"revoked_at"`
+        RevocationReason sql.NullString `db:"revocation_reason"`
+        PEM              sql.NullString `db:"pem"`
+        CreatedAt        string         `db:"created_at"`
+        UpdatedAt        string         `db:"updated_at"`
+    }
+    query := `
+SELECT id, authority_id, serial_number, subject, sans, owner_user_id, owner_device_id, provisioner_id, policy_id,
+       issued_at, not_before, not_after, revoked, revoked_at, revocation_reason, pem, created_at, updated_at
+FROM certificates
+WHERE owner_user_id = ?
+ORDER BY issued_at DESC
+LIMIT 1000
+`
+    if err := r.db.SelectContext(ctx, &rows, query, ownerUserID); err != nil {
+        return nil, err
+    }
+    out := make([]Certificate, 0, len(rows))
+    for _, rr := range rows {
+        c := Certificate{
+            ID:           rr.ID,
+            AuthorityID:  rr.AuthorityID,
+            SerialNumber: rr.SerialNumber,
+            Subject:      rr.Subject,
+            IssuedAt:     rr.IssuedAt,
+            CreatedAt:    rr.CreatedAt,
+            UpdatedAt:    rr.UpdatedAt,
+            SANs:         []string{},
+            Revoked:      rr.Revoked != 0,
+        }
+        if rr.SANs.Valid && rr.SANs.String != "" {
+            _ = json.Unmarshal([]byte(rr.SANs.String), &c.SANs)
+        }
+        if rr.OwnerUserID.Valid {
+            v := rr.OwnerUserID.String
+            c.OwnerUserID = &v
+        }
+        if rr.OwnerDeviceID.Valid {
+            v := rr.OwnerDeviceID.String
+            c.OwnerDeviceID = &v
+        }
+        if rr.ProvisionerID.Valid {
+            v := rr.ProvisionerID.String
+            c.ProvisionerID = &v
+        }
+        if rr.PolicyID.Valid {
+            v := rr.PolicyID.String
+            c.PolicyID = &v
+        }
+        if rr.NotBefore.Valid {
+            v := rr.NotBefore.String
+            c.NotBefore = &v
+        }
+        if rr.NotAfter.Valid {
+            v := rr.NotAfter.String
+            c.NotAfter = &v
+        }
+        if rr.RevokedAt.Valid {
+            v := rr.RevokedAt.String
+            c.RevokedAt = &v
+        }
+        if rr.RevocationReason.Valid {
+            v := rr.RevocationReason.String
+            c.RevocationReason = &v
+        }
+        if rr.PEM.Valid {
+            v := rr.PEM.String
+            c.PEM = &v
+        }
+        out = append(out, c)
+    }
+    return out, nil
+}
+
+// ListByDevice returns certificates associated with a device.
+func (r *certificateRepository) ListByDevice(ctx context.Context, deviceID string) ([]Certificate, error) {
+    var rows []struct {
+        ID               string         `db:"id"`
+        AuthorityID      string         `db:"authority_id"`
+        SerialNumber     string         `db:"serial_number"`
+        Subject          string         `db:"subject"`
+        SANs             sql.NullString `db:"sans"`
+        OwnerUserID      sql.NullString `db:"owner_user_id"`
+        OwnerDeviceID    sql.NullString `db:"owner_device_id"`
+        ProvisionerID    sql.NullString `db:"provisioner_id"`
+        PolicyID         sql.NullString `db:"policy_id"`
+        IssuedAt         string         `db:"issued_at"`
+        NotBefore        sql.NullString `db:"not_before"`
+        NotAfter         sql.NullString `db:"not_after"`
+        Revoked          int            `db:"revoked"`
+        RevokedAt        sql.NullString `db:"revoked_at"`
+        RevocationReason sql.NullString `db:"revocation_reason"`
+        PEM              sql.NullString `db:"pem"`
+        CreatedAt        string         `db:"created_at"`
+        UpdatedAt        string         `db:"updated_at"`
+    }
+    query := `
+SELECT id, authority_id, serial_number, subject, sans, owner_user_id, owner_device_id, provisioner_id, policy_id,
+       issued_at, not_before, not_after, revoked, revoked_at, revocation_reason, pem, created_at, updated_at
+FROM certificates
+WHERE owner_device_id = ?
+ORDER BY issued_at DESC
+LIMIT 1000
+`
+    if err := r.db.SelectContext(ctx, &rows, query, deviceID); err != nil {
+        return nil, err
+    }
+    out := make([]Certificate, 0, len(rows))
+    for _, rr := range rows {
+        c := Certificate{
+            ID:           rr.ID,
+            AuthorityID:  rr.AuthorityID,
+            SerialNumber: rr.SerialNumber,
+            Subject:      rr.Subject,
+            IssuedAt:     rr.IssuedAt,
+            CreatedAt:    rr.CreatedAt,
+            UpdatedAt:    rr.UpdatedAt,
+            SANs:         []string{},
+            Revoked:      rr.Revoked != 0,
+        }
+        if rr.SANs.Valid && rr.SANs.String != "" {
+            _ = json.Unmarshal([]byte(rr.SANs.String), &c.SANs)
+        }
+        if rr.OwnerUserID.Valid {
+            v := rr.OwnerUserID.String
+            c.OwnerUserID = &v
+        }
+        if rr.OwnerDeviceID.Valid {
+            v := rr.OwnerDeviceID.String
+            c.OwnerDeviceID = &v
+        }
+        if rr.ProvisionerID.Valid {
+            v := rr.ProvisionerID.String
+            c.ProvisionerID = &v
+        }
+        if rr.PolicyID.Valid {
+            v := rr.PolicyID.String
+            c.PolicyID = &v
+        }
+        if rr.NotBefore.Valid {
+            v := rr.NotBefore.String
+            c.NotBefore = &v
+        }
+        if rr.NotAfter.Valid {
+            v := rr.NotAfter.String
+            c.NotAfter = &v
+        }
+        if rr.RevokedAt.Valid {
+            v := rr.RevokedAt.String
+            c.RevokedAt = &v
+        }
+        if rr.RevocationReason.Valid {
+            v := rr.RevocationReason.String
+            c.RevocationReason = &v
+        }
+        if rr.PEM.Valid {
+            v := rr.PEM.String
+            c.PEM = &v
+        }
+        out = append(out, c)
+    }
+    return out, nil
+}
+
+// ListByAuthority returns certificates issued by an authority.
+func (r *certificateRepository) ListByAuthority(ctx context.Context, authorityID string) ([]Certificate, error) {
+    var rows []struct {
+        ID               string         `db:"id"`
+        AuthorityID      string         `db:"authority_id"`
+        SerialNumber     string         `db:"serial_number"`
+        Subject          string         `db:"subject"`
+        SANs             sql.NullString `db:"sans"`
+        OwnerUserID      sql.NullString `db:"owner_user_id"`
+        OwnerDeviceID    sql.NullString `db:"owner_device_id"`
+        ProvisionerID    sql.NullString `db:"provisioner_id"`
+        PolicyID         sql.NullString `db:"policy_id"`
+        IssuedAt         string         `db:"issued_at"`
+        NotBefore        sql.NullString `db:"not_before"`
+        NotAfter         sql.NullString `db:"not_after"`
+        Revoked          int            `db:"revoked"`
+        RevokedAt        sql.NullString `db:"revoked_at"`
+        RevocationReason sql.NullString `db:"revocation_reason"`
+        PEM              sql.NullString `db:"pem"`
+        CreatedAt        string         `db:"created_at"`
+        UpdatedAt        string         `db:"updated_at"`
+    }
+    query := `
+SELECT id, authority_id, serial_number, subject, sans, owner_user_id, owner_device_id, provisioner_id, policy_id,
+       issued_at, not_before, not_after, revoked, revoked_at, revocation_reason, pem, created_at, updated_at
+FROM certificates
+WHERE authority_id = ?
+ORDER BY issued_at DESC
+LIMIT 2000
+`
+    if err := r.db.SelectContext(ctx, &rows, query, authorityID); err != nil {
+        return nil, err
+    }
+    out := make([]Certificate, 0, len(rows))
+    for _, rr := range rows {
+        c := Certificate{
+            ID:           rr.ID,
+            AuthorityID:  rr.AuthorityID,
+            SerialNumber: rr.SerialNumber,
+            Subject:      rr.Subject,
+            IssuedAt:     rr.IssuedAt,
+            CreatedAt:    rr.CreatedAt,
+            UpdatedAt:    rr.UpdatedAt,
+            SANs:         []string{},
+            Revoked:      rr.Revoked != 0,
+        }
+        if rr.SANs.Valid && rr.SANs.String != "" {
+            _ = json.Unmarshal([]byte(rr.SANs.String), &c.SANs)
+        }
+        if rr.OwnerUserID.Valid {
+            v := rr.OwnerUserID.String
+            c.OwnerUserID = &v
+        }
+        if rr.OwnerDeviceID.Valid {
+            v := rr.OwnerDeviceID.String
+            c.OwnerDeviceID = &v
+        }
+        if rr.ProvisionerID.Valid {
+            v := rr.ProvisionerID.String
+            c.ProvisionerID = &v
+        }
+        if rr.PolicyID.Valid {
+            v := rr.PolicyID.String
+            c.PolicyID = &v
+        }
+        if rr.NotBefore.Valid {
+            v := rr.NotBefore.String
+            c.NotBefore = &v
+        }
+        if rr.NotAfter.Valid {
+            v := rr.NotAfter.String
+            c.NotAfter = &v
+        }
+        if rr.RevokedAt.Valid {
+            v := rr.RevokedAt.String
+            c.RevokedAt = &v
+        }
+        if rr.RevocationReason.Valid {
+            v := rr.RevocationReason.String
+            c.RevocationReason = &v
+        }
+        if rr.PEM.Valid {
+            v := rr.PEM.String
+            c.PEM = &v
+        }
+        out = append(out, c)
+    }
+    return out, nil
+}
+
+// Revoke marks a certificate as revoked and records reason and timestamp.
+func (r *certificateRepository) Revoke(ctx context.Context, id string, reason string) error {
+    now := time.Now().UTC().Format(time.RFC3339)
     query := `
 UPDATE certificates SET
-  subject_cn = :subject_cn,
-  subject_o = :subject_o,
-  san = :san,
-  cert_pem = :cert_pem,
-  issued_at = :issued_at,
-  expires_at = :expires_at,
-  status = :status,
+  revoked = 1,
+  revoked_at = :revoked_at,
   revocation_reason = :revocation_reason,
-  revocation_time = :revocation_time,
-  issue_method = :issue_method,
-  stepca_metadata = :stepca_metadata,
-  approval_id = :approval_id,
+  updated_at = :updated_at
+WHERE id = :id
+`
+    params := map[string]interface{}{
+        "id":                id,
+        "revoked_at":        now,
+        "revocation_reason": reason,
+        "updated_at":        now,
+    }
+    res, err := r.db.NamedExecContext(ctx, query, params)
+    if err != nil {
+        return err
+    }
+    ra, err := res.RowsAffected()
+    if err != nil {
+        return err
+    }
+    if ra == 0 {
+        return fmt.Errorf("certificate not found")
+    }
+    return nil
+}
+
+// Update updates mutable fields of a certificate (PEM, metadata-like fields).
+func (r *certificateRepository) Update(ctx context.Context, c *Certificate) error {
+    c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+
+    sansJSON := "[]"
+    if c.SANs != nil {
+        b, err := json.Marshal(c.SANs)
+        if err != nil {
+            return fmt.Errorf("marshal sans: %w", err)
+        }
+        sansJSON = string(b)
+    }
+
+    query := `
+UPDATE certificates SET
+  subject = :subject,
+  sans = :sans,
   owner_user_id = :owner_user_id,
   owner_device_id = :owner_device_id,
+  provisioner_id = :provisioner_id,
+  policy_id = :policy_id,
+  not_before = :not_before,
+  not_after = :not_after,
+  pem = :pem,
+  revoked = :revoked,
+  revoked_at = :revoked_at,
+  revocation_reason = :revocation_reason,
   updated_at = :updated_at
 WHERE id = :id
 `
     params := map[string]interface{}{
         "id":                c.ID,
-        "subject_cn":        c.SubjectCN,
-        "subject_o":         c.SubjectO,
-        "san":               c.SAN,
-        "cert_pem":          c.CertPEM,
-        "issued_at":         c.IssuedAt,
-        "expires_at":        c.ExpiresAt,
-        "status":            c.Status,
-        "revocation_reason": c.RevocationReason,
-        "revocation_time":   c.RevocationTime,
-        "issue_method":      c.IssueMethod,
-        "stepca_metadata":   c.Metadata,
-        "approval_id":       c.ApprovalID,
+        "subject":           c.Subject,
+        "sans":              sansJSON,
         "owner_user_id":     c.OwnerUserID,
         "owner_device_id":   c.OwnerDeviceID,
+        "provisioner_id":    c.ProvisionerID,
+        "policy_id":         c.PolicyID,
+        "not_before":        c.NotBefore,
+        "not_after":         c.NotAfter,
+        "pem":               c.PEM,
+        "revoked":           c.Revoked,
+        "revoked_at":        c.RevokedAt,
+        "revocation_reason": c.RevocationReason,
         "updated_at":        c.UpdatedAt,
     }
-    _, err := r.db.NamedExecContext(ctx, query, params)
-    return err
+    res, err := r.db.NamedExecContext(ctx, query, params)
+    if err != nil {
+        return err
+    }
+    ra, err := res.RowsAffected()
+    if err != nil {
+        return err
+    }
+    if ra == 0 {
+        return fmt.Errorf("certificate not found")
+    }
+    return nil
 }
 
 // Delete removes a certificate record.
 func (r *certificateRepository) Delete(ctx context.Context, id string) error {
-    _, err := r.db.ExecContext(ctx, `DELETE FROM certificates WHERE id = ?`, id)
-    return err
+    res, err := r.db.ExecContext(ctx, `DELETE FROM certificates WHERE id = ?`, id)
+    if err != nil {
+        return err
+    }
+    ra, err := res.RowsAffected()
+    if err != nil {
+        return err
+    }
+    if ra == 0 {
+        return fmt.Errorf("certificate not found")
+    }
+    return nil
 }
 
 //
-// Viewer / scoping helpers
+// Visibility helpers
 //
 
-// ListForUser returns certificates visible to a given user:
-// - certificates owned by the user
-// - certificates linked to approvals requested by the user
-// - certificates for devices owned by the user
+// ListForUser returns certificates visible to a given user.
+// Visibility rules:
+// - Certificates owned by the user.
+// - Certificates for devices in groups the user belongs to.
+// - Certificates referenced by approvals requested by the user.
 func (r *certificateRepository) ListForUser(ctx context.Context, userID string) ([]Certificate, error) {
-    var certs []Certificate
+    var rows []struct {
+        ID               string         `db:"id"`
+        AuthorityID      string         `db:"authority_id"`
+        SerialNumber     string         `db:"serial_number"`
+        Subject          string         `db:"subject"`
+        SANs             sql.NullString `db:"sans"`
+        OwnerUserID      sql.NullString `db:"owner_user_id"`
+        OwnerDeviceID    sql.NullString `db:"owner_device_id"`
+        ProvisionerID    sql.NullString `db:"provisioner_id"`
+        PolicyID         sql.NullString `db:"policy_id"`
+        IssuedAt         string         `db:"issued_at"`
+        NotBefore        sql.NullString `db:"not_before"`
+        NotAfter         sql.NullString `db:"not_after"`
+        Revoked          int            `db:"revoked"`
+        RevokedAt        sql.NullString `db:"revoked_at"`
+        RevocationReason sql.NullString `db:"revocation_reason"`
+        PEM              sql.NullString `db:"pem"`
+        CreatedAt        string         `db:"created_at"`
+        UpdatedAt        string         `db:"updated_at"`
+    }
+    // We join devices and users to allow group-based visibility (devices.group_id vs users.groups JSON).
     query := `
-SELECT DISTINCT c.id, c.authority_id, c.policy_id, c.provisioner_id, c.serial AS serial_number,
-       c.subject_cn, c.subject_o, c.san, c.cert_pem, c.issued_at, c.expires_at, c.status,
-       c.revocation_reason, c.revocation_time, c.issue_method, c.stepca_metadata AS metadata,
-       c.approval_id, c.owner_user_id, c.owner_device_id, c.created_at, c.updated_at
+SELECT DISTINCT c.id, c.authority_id, c.serial_number, c.subject, c.sans, c.owner_user_id, c.owner_device_id, c.provisioner_id, c.policy_id,
+       c.issued_at, c.not_before, c.not_after, c.revoked, c.revoked_at, c.revocation_reason, c.pem, c.created_at, c.updated_at
 FROM certificates c
-LEFT JOIN approvals a ON c.approval_id = a.id
 LEFT JOIN devices d ON c.owner_device_id = d.id
-WHERE c.owner_user_id = ?
-   OR a.requester_id = ?
-   OR d.owner_user_id = ?
-ORDER BY c.created_at DESC
+LEFT JOIN users u ON u.id = ?
+LEFT JOIN approvals a ON a.id = c.approval_id
+WHERE (c.owner_user_id = ?)
+   OR (d.group_id IS NOT NULL AND JSON_CONTAINS(u.groups, CONCAT('"', d.group_id, '"')))
+   OR (a.requester_id = ?)
+ORDER BY c.issued_at DESC
+LIMIT 2000
 `
-    if err := r.db.SelectContext(ctx, &certs, query, userID, userID, userID); err != nil {
+    if err := r.db.SelectContext(ctx, &rows, query, userID, userID, userID); err != nil {
         return nil, err
     }
-    return certs, nil
-}
-
-// IsVisibleToUser checks whether an authority (by id) is visible to a user.
-// Returns true if the user owns a certificate issued by that authority or requested an approval referencing it.
-func (r *certificateRepository) IsVisibleToUser(ctx context.Context, authorityID string, userID string) (bool, error) {
-    query := `
-SELECT 1
-FROM certificates c
-LEFT JOIN approvals a ON c.approval_id = a.id
-LEFT JOIN devices d ON c.owner_device_id = d.id
-WHERE c.authority_id = ?
-  AND (c.owner_user_id = ? OR a.requester_id = ? OR d.owner_user_id = ?)
-LIMIT 1
-`
-    var dummy int
-    err := r.db.GetContext(ctx, &dummy, query, authorityID, userID, userID, userID)
-    if err != nil {
-        if err == sql.ErrNoRows {
-            return false, nil
+    out := make([]Certificate, 0, len(rows))
+    for _, rr := range rows {
+        c := Certificate{
+            ID:           rr.ID,
+            AuthorityID:  rr.AuthorityID,
+            SerialNumber: rr.SerialNumber,
+            Subject:      rr.Subject,
+            IssuedAt:     rr.IssuedAt,
+            CreatedAt:    rr.CreatedAt,
+            UpdatedAt:    rr.UpdatedAt,
+            SANs:         []string{},
+            Revoked:      rr.Revoked != 0,
         }
-        return false, err
+        if rr.SANs.Valid && rr.SANs.String != "" {
+            _ = json.Unmarshal([]byte(rr.SANs.String), &c.SANs)
+        }
+        if rr.OwnerUserID.Valid {
+            v := rr.OwnerUserID.String
+            c.OwnerUserID = &v
+        }
+        if rr.OwnerDeviceID.Valid {
+            v := rr.OwnerDeviceID.String
+            c.OwnerDeviceID = &v
+        }
+        if rr.ProvisionerID.Valid {
+            v := rr.ProvisionerID.String
+            c.ProvisionerID = &v
+        }
+        if rr.PolicyID.Valid {
+            v := rr.PolicyID.String
+            c.PolicyID = &v
+        }
+        if rr.NotBefore.Valid {
+            v := rr.NotBefore.String
+            c.NotBefore = &v
+        }
+        if rr.NotAfter.Valid {
+            v := rr.NotAfter.String
+            c.NotAfter = &v
+        }
+        if rr.RevokedAt.Valid {
+            v := rr.RevokedAt.String
+            c.RevokedAt = &v
+        }
+        if rr.RevocationReason.Valid {
+            v := rr.RevocationReason.String
+            c.RevocationReason = &v
+        }
+        if rr.PEM.Valid {
+            v := rr.PEM.String
+            c.PEM = &v
+        }
+        out = append(out, c)
     }
-    return true, nil
+    return out, nil
 }
 
-// ListByOwner returns certificates owned by a specific user.
-func (r *certificateRepository) ListByOwner(ctx context.Context, ownerUserID string) ([]Certificate, error) {
-    var certs []Certificate
-    query := `
-SELECT id, authority_id, policy_id, provisioner_id, serial AS serial_number,
-       subject_cn, subject_o, san, cert_pem, issued_at, expires_at, status,
-       revocation_reason, revocation_time, issue_method, stepca_metadata AS metadata,
-       approval_id, owner_user_id, owner_device_id, created_at, updated_at
-FROM certificates
-WHERE owner_user_id = ?
-ORDER BY created_at DESC
-`
-    if err := r.db.SelectContext(ctx, &certs, query, ownerUserID); err != nil {
-        return nil, err
-    }
-    return certs, nil
-}
-
-// ListByGroups returns certificates that belong to devices/users in the provided groups.
-// groupIDs is a slice of group id strings.
-func (r *certificateRepository) ListByGroups(ctx context.Context, groupIDs []string) ([]Certificate, error) {
-    if len(groupIDs) == 0 {
-        return []Certificate{}, nil
-    }
-
-    // Build placeholders for IN clause
-    placeholders := strings.Repeat("?,", len(groupIDs))
-    placeholders = strings.TrimRight(placeholders, ",")
-
-    // Query certificates where device.group_id IN (...) OR owner_user has group membership (JSON_CONTAINS)
-    // Note: JSON_CONTAINS(users.groups, '["groupid"]') is used for user group membership.
-    // We join devices and users to evaluate group membership.
-    query := fmt.Sprintf(`
-SELECT DISTINCT c.id, c.authority_id, c.policy_id, c.provisioner_id, c.serial AS serial_number,
-       c.subject_cn, c.subject_o, c.san, c.cert_pem, c.issued_at, c.expires_at, c.status,
-       c.revocation_reason, c.revocation_time, c.issue_method, c.stepca_metadata AS metadata,
-       c.approval_id, c.owner_user_id, c.owner_device_id, c.created_at, c.updated_at
-FROM certificates c
-LEFT JOIN devices d ON c.owner_device_id = d.id
-LEFT JOIN users u ON c.owner_user_id = u.id
-WHERE (d.group_id IN (%s))
-   OR (%s)
-ORDER BY c.created_at DESC
-`, placeholders, buildJSONContainsOrClause("u.groups", groupIDs))
-
-    // Build args: groupIDs repeated for IN clause; JSON_CONTAINS uses literals in query string, so no args for that part.
-    args := make([]interface{}, len(groupIDs))
-    for i, g := range groupIDs {
-        args[i] = g
-    }
-
-    var certs []Certificate
-    if err := r.db.SelectContext(ctx, &certs, query, args...); err != nil {
-        return nil, err
-    }
-    return certs, nil
-}
-
-// IsOwnedBy checks whether a certificate is owned by a given user (direct owner or device owner).
-func (r *certificateRepository) IsOwnedBy(ctx context.Context, certID string, userID string) (bool, error) {
+// IsVisibleToUser checks whether a certificate is visible to a user.
+func (r *certificateRepository) IsVisibleToUser(ctx context.Context, certID string, userID string) (bool, error) {
     query := `
 SELECT 1
 FROM certificates c
 LEFT JOIN devices d ON c.owner_device_id = d.id
+LEFT JOIN users u ON u.id = ?
+LEFT JOIN approvals a ON a.id = c.approval_id
 WHERE c.id = ?
-  AND (c.owner_user_id = ? OR d.owner_user_id = ?)
+  AND (
+       c.owner_user_id = ?
+    OR (d.group_id IS NOT NULL AND JSON_CONTAINS(u.groups, CONCAT('"', d.group_id, '"')))
+    OR (a.requester_id = ?)
+  )
 LIMIT 1
 `
     var dummy int
-    err := r.db.GetContext(ctx, &dummy, query, certID, userID, userID)
+    err := r.db.GetContext(ctx, &dummy, query, userID, certID, userID, userID)
     if err != nil {
         if err == sql.ErrNoRows {
             return false, nil
@@ -343,54 +717,4 @@ LIMIT 1
         return false, err
     }
     return true, nil
-}
-
-// IsInGroups checks whether a certificate belongs to any of the provided groups.
-func (r *certificateRepository) IsInGroups(ctx context.Context, certID string, groupIDs []string) (bool, error) {
-    if len(groupIDs) == 0 {
-        return false, nil
-    }
-    placeholders := strings.Repeat("?,", len(groupIDs))
-    placeholders = strings.TrimRight(placeholders, ",")
-
-    query := fmt.Sprintf(`
-SELECT 1
-FROM certificates c
-LEFT JOIN devices d ON c.owner_device_id = d.id
-LEFT JOIN users u ON c.owner_user_id = u.id
-WHERE c.id = ?
-  AND (d.group_id IN (%s) OR %s)
-LIMIT 1
-`, placeholders, buildJSONContainsOrClause("u.groups", groupIDs))
-
-    args := make([]interface{}, 0, 1+len(groupIDs))
-    args = append(args, certID)
-    for _, g := range groupIDs {
-        args = append(args, g)
-    }
-
-    var dummy int
-    err := r.db.GetContext(ctx, &dummy, query, args...)
-    if err != nil {
-        if err == sql.ErrNoRows {
-            return false, nil
-        }
-        return false, err
-    }
-    return true, nil
-}
-
-//
-// Helper utilities
-//
-
-// buildJSONContainsOrClause builds an OR clause that checks JSON_CONTAINS(field, '["id"]') for each group id.
-// Example output: (JSON_CONTAINS(u.groups, '["g1"]') OR JSON_CONTAINS(u.groups, '["g2"]'))
-func buildJSONContainsOrClause(jsonField string, ids []string) string {
-    parts := make([]string, 0, len(ids))
-    for _, id := range ids {
-        // JSON_CONTAINS requires a JSON array literal; we embed the id as a string literal.
-        parts = append(parts, fmt.Sprintf("JSON_CONTAINS(%s, '\"%s\"')", jsonField, id))
-    }
-    return "(" + strings.Join(parts, " OR ") + ")"
 }
