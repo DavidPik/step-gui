@@ -39,6 +39,14 @@ type UserRepository interface {
     GetRoles(ctx context.Context, userID string) ([]string, error)
     GetGroups(ctx context.Context, userID string) ([]string, error)
     IsInGroup(ctx context.Context, userID string, groupID string) (bool, error)
+
+    // Additional helpers
+    IsInRole(ctx context.Context, userID string, roleName string) (bool, error)
+    ListByGroup(ctx context.Context, groupID string) ([]User, error)
+    ListApproversForGroup(ctx context.Context, groupID string) ([]User, error)
+
+    // RedactForAPI returns a copy of the user safe for returning to clients (removes sensitive fields).
+    RedactForAPI(u *User) *User
 }
 
 type userRepository struct {
@@ -212,14 +220,34 @@ WHERE id = :id
         "updated_at":   u.UpdatedAt,
     }
 
-    _, err := r.db.NamedExecContext(ctx, query, params)
-    return err
+    res, err := r.db.NamedExecContext(ctx, query, params)
+    if err != nil {
+        return err
+    }
+    ra, err := res.RowsAffected()
+    if err != nil {
+        return err
+    }
+    if ra == 0 {
+        return fmt.Errorf("user not found")
+    }
+    return nil
 }
 
 // Delete removes a user record.
 func (r *userRepository) Delete(ctx context.Context, id string) error {
-    _, err := r.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, id)
-    return err
+    res, err := r.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, id)
+    if err != nil {
+        return err
+    }
+    ra, err := res.RowsAffected()
+    if err != nil {
+        return err
+    }
+    if ra == 0 {
+        return fmt.Errorf("user not found")
+    }
+    return nil
 }
 
 //
@@ -246,14 +274,187 @@ func (r *userRepository) GetGroups(ctx context.Context, userID string) ([]string
 
 // IsInGroup checks whether the user is a member of the given group.
 func (r *userRepository) IsInGroup(ctx context.Context, userID string, groupID string) (bool, error) {
-    groups, err := r.GetGroups(ctx, userID)
+    // Use JSON_CONTAINS to avoid loading full user record.
+    // JSON_CONTAINS(groups, '"groupID"')
+    query := `SELECT 1 FROM users WHERE id = ? AND JSON_CONTAINS(groups, ?) LIMIT 1`
+    needle := fmt.Sprintf(`"%s"`, groupID)
+    var dummy int
+    err := r.db.GetContext(ctx, &dummy, query, userID, needle)
     if err != nil {
+        if err == sql.ErrNoRows {
+            return false, nil
+        }
         return false, err
     }
-    for _, g := range groups {
-        if g == groupID {
-            return true, nil
+    return true, nil
+}
+
+// IsInRole checks whether the user has a given role name.
+func (r *userRepository) IsInRole(ctx context.Context, userID string, roleName string) (bool, error) {
+    // JSON_CONTAINS(roles, '"roleName"')
+    query := `SELECT 1 FROM users WHERE id = ? AND JSON_CONTAINS(roles, ?) LIMIT 1`
+    needle := fmt.Sprintf(`"%s"`, roleName)
+    var dummy int
+    err := r.db.GetContext(ctx, &dummy, query, userID, needle)
+    if err != nil {
+        if err == sql.ErrNoRows {
+            return false, nil
+        }
+        return false, err
+    }
+    return true, nil
+}
+
+// ListByGroup returns users that belong to a specific group.
+func (r *userRepository) ListByGroup(ctx context.Context, groupID string) ([]User, error) {
+    var rows []struct {
+        ID          string         `db:"id"`
+        Username    string         `db:"username"`
+        DisplayName string         `db:"display_name"`
+        Email       string         `db:"email"`
+        Roles       sql.NullString `db:"roles"`
+        Groups      sql.NullString `db:"groups"`
+        Status      string         `db:"status"`
+        AuthSource  string         `db:"auth_source"`
+        MFAConfig   *string        `db:"mfa_config"`
+        CreatedAt   string         `db:"created_at"`
+        UpdatedAt   string         `db:"updated_at"`
+    }
+    query := `SELECT id, username, display_name, email, roles, groups, status, auth_source, mfa_config, created_at, updated_at FROM users WHERE JSON_CONTAINS(groups, ?) ORDER BY username ASC LIMIT 1000`
+    needle := fmt.Sprintf(`"%s"`, groupID)
+    if err := r.db.SelectContext(ctx, &rows, query, needle); err != nil {
+        return nil, err
+    }
+
+    out := make([]User, 0, len(rows))
+    for _, rr := range rows {
+        u := User{
+            ID:          rr.ID,
+            Username:    rr.Username,
+            DisplayName: rr.DisplayName,
+            Email:       rr.Email,
+            Status:      rr.Status,
+            AuthSource:  rr.AuthSource,
+            MFAConfig:   rr.MFAConfig,
+            CreatedAt:   rr.CreatedAt,
+            UpdatedAt:   rr.UpdatedAt,
+        }
+        if rr.Roles.Valid {
+            _ = json.Unmarshal([]byte(rr.Roles.String), &u.Roles)
+        }
+        if rr.Groups.Valid {
+            _ = json.Unmarshal([]byte(rr.Groups.String), &u.Groups)
+        }
+        out = append(out, u)
+    }
+    return out, nil
+}
+
+// ListApproversForGroup returns users who are approvers for the given group.
+// Logic:
+// 1. Try to read groups.approver_role_id. If set, resolve that role id to a role name and find users whose roles JSON contains that role name and who are members of the group.
+// 2. If approver_role_id is not set or role lookup fails, fall back to users with role name "approver" who are members of the group.
+func (r *userRepository) ListApproversForGroup(ctx context.Context, groupID string) ([]User, error) {
+    // Step 1: get approver_role_id from groups
+    var approverRoleID sql.NullString
+    if err := r.db.GetContext(ctx, &approverRoleID, `SELECT approver_role_id FROM groups WHERE id = ? LIMIT 1`, groupID); err != nil {
+        if err == sql.ErrNoRows {
+            // No such group -> empty list
+            return nil, nil
+        }
+        return nil, err
+    }
+
+    roleName := ""
+    if approverRoleID.Valid && approverRoleID.String != "" {
+        // Resolve role name
+        var rn sql.NullString
+        if err := r.db.GetContext(ctx, &rn, `SELECT name FROM roles WHERE id = ? LIMIT 1`, approverRoleID.String); err != nil {
+            // If role lookup fails, we'll fall back to default below
+            roleName = ""
+        } else if rn.Valid {
+            roleName = rn.String
         }
     }
-    return false, nil
+
+    if roleName == "" {
+        // fallback to literal role name "approver"
+        roleName = "approver"
+    }
+
+    needleRole := fmt.Sprintf(`"%s"`, roleName)
+    needleGroup := fmt.Sprintf(`"%s"`, groupID)
+
+    var rows []struct {
+        ID          string         `db:"id"`
+        Username    string         `db:"username"`
+        DisplayName string         `db:"display_name"`
+        Email       string         `db:"email"`
+        Roles       sql.NullString `db:"roles"`
+        Groups      sql.NullString `db:"groups"`
+        Status      string         `db:"status"`
+        AuthSource  string         `db:"auth_source"`
+        MFAConfig   *string        `db:"mfa_config"`
+        CreatedAt   string         `db:"created_at"`
+        UpdatedAt   string         `db:"updated_at"`
+    }
+
+    query := `SELECT id, username, display_name, email, roles, groups, status, auth_source, mfa_config, created_at, updated_at FROM users WHERE JSON_CONTAINS(roles, ?) AND JSON_CONTAINS(groups, ?) ORDER BY username ASC LIMIT 1000`
+    if err := r.db.SelectContext(ctx, &rows, query, needleRole, needleGroup); err != nil {
+        return nil, err
+    }
+
+    out := make([]User, 0, len(rows))
+    for _, rr := range rows {
+        u := User{
+            ID:          rr.ID,
+            Username:    rr.Username,
+            DisplayName: rr.DisplayName,
+            Email:       rr.Email,
+            Status:      rr.Status,
+            AuthSource:  rr.AuthSource,
+            MFAConfig:   rr.MFAConfig,
+            CreatedAt:   rr.CreatedAt,
+            UpdatedAt:   rr.UpdatedAt,
+        }
+        if rr.Roles.Valid {
+            _ = json.Unmarshal([]byte(rr.Roles.String), &u.Roles)
+        }
+        if rr.Groups.Valid {
+            _ = json.Unmarshal([]byte(rr.Groups.String), &u.Groups)
+        }
+        out = append(out, u)
+    }
+    return out, nil
+}
+
+// RedactForAPI returns a copy of the user safe for returning to clients (removes sensitive fields).
+func (r *userRepository) RedactForAPI(u *User) *User {
+    if u == nil {
+        return nil
+    }
+    redacted := *u
+    // Remove MFA config from API responses
+    redacted.MFAConfig = nil
+    // Mask email local part but keep domain for usability
+    if redacted.Email != "" {
+        // simple mask: keep domain, replace local part with first char + ****
+        at := -1
+        for i := len(redacted.Email) - 1; i >= 0; i-- {
+            if redacted.Email[i] == '@' {
+                at = i
+                break
+            }
+        }
+        if at > 1 {
+            local := redacted.Email[:at]
+            domain := redacted.Email[at:]
+            if len(local) > 1 {
+                redacted.Email = local[:1] + "****" + domain
+            } else {
+                redacted.Email = "****" + domain
+            }
+        }
+    }
+    return &redacted
 }
